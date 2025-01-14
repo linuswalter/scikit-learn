@@ -1695,3 +1695,110 @@ cdef class Poisson(RegressionCriterion):
 
                 poisson_loss += w * xlogy(y[i, k], y[i, k] / y_mean)
         return poisson_loss / (weight_sum * n_outputs)
+
+cdef class MEE(RegressionCriterion):
+    """Mean Exponential Error impurity criterion.
+
+    MEE = np.average(basis^y_true - basis^y_pred)
+    """
+
+    cdef float64_t node_impurity(self, double basis=10.0) noexcept nogil:
+        """Evaluate the impurity of the current node.
+
+        Evaluate the MEE criterion as impurity of the current node,
+        i.e. the impurity of sample_indices[start:end]. The smaller the impurity the
+        better.
+        """
+        cdef float64_t impurity
+        cdef intp_t k
+
+        impurity = 0.0
+        for k in range(self.n_outputs):
+            impurity += np.power(basis, self.sum_total[k] / self.weighted_n_node_samples)
+
+        return impurity / self.n_outputs
+
+    cdef float64_t proxy_impurity_improvement(self, double basis=10.0) noexcept nogil:
+        """Compute a proxy of the impurity reduction.
+
+        This method is used to speed up the search for the best split.
+        It is a proxy quantity such that the split that maximizes this value
+        also maximizes the impurity improvement. It neglects all constant terms
+        of the impurity decrease for a given split.
+
+        The absolute impurity improvement is only computed by the
+        impurity_improvement method once the best split has been found.
+
+        The MEE proxy is derived from
+
+            np.average(basis^y_true - basis^y_pred)
+
+        Neglecting constant terms, this gives:
+
+            sum(basis^sum_left) / n_left + sum(basis^sum_right) / n_right
+        """
+        cdef intp_t k
+        cdef float64_t proxy_impurity_left = 0.0
+        cdef float64_t proxy_impurity_right = 0.0
+
+        for k in range(self.n_outputs):
+            proxy_impurity_left += np.power(basis, self.sum_left[k])
+            proxy_impurity_right += np.power(basis, self.sum_right[k])
+
+        return (proxy_impurity_left / self.weighted_n_left +
+                proxy_impurity_right / self.weighted_n_right)
+
+    cdef void children_impurity(self, float64_t* impurity_left,
+                                float64_t* impurity_right, double basis=10.0) noexcept nogil:
+        """Evaluate the impurity in children nodes.
+
+        i.e. the impurity of the left child (sample_indices[start:pos]) and the
+        impurity of the right child (sample_indices[pos:end]).
+        """
+        cdef const float64_t[:] sample_weight = self.sample_weight
+        cdef const intp_t[:] sample_indices = self.sample_indices
+        cdef intp_t pos = self.pos
+        cdef intp_t start = self.start
+
+        cdef float64_t y_ik
+
+        cdef float64_t sq_sum_left = 0.0
+        cdef float64_t sq_sum_right
+
+        cdef intp_t i
+        cdef intp_t p
+        cdef intp_t k
+        cdef float64_t w = 1.0
+
+        cdef intp_t end_non_missing
+
+        for p in range(start, pos):
+            i = sample_indices[p]
+
+            if sample_weight is not None:
+                w = sample_weight[i]
+
+            for k in range(self.n_outputs):
+                y_ik = self.y[i, k]
+                sq_sum_left += w * np.power(basis, y_ik)
+
+        if self.missing_go_to_left:
+            # add up the impact of these missing values on the left child
+            # statistics.
+            # Note: this only impacts the exponential sum as the sum
+            # is modified elsewhere.
+            end_non_missing = self.end - self.n_missing
+
+            for p in range(end_non_missing, self.end):
+                i = sample_indices[p]
+                if sample_weight is not None:
+                    w = sample_weight[i]
+
+                for k in range(self.n_outputs):
+                    y_ik = self.y[i, k]
+                    sq_sum_left += w * np.power(basis, y_ik)
+
+        sq_sum_right = self.sq_sum_total - sq_sum_left
+
+        impurity_left[0] = sq_sum_left / self.weighted_n_left
+        impurity_right[0] = sq_sum_right / self.weighted_n_right
